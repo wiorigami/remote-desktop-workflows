@@ -50,6 +50,21 @@ jobs:
           Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pw -Force)
           Write-Host "password configured"
 
+      - name: Add loopback alias for WARP private route
+        run: |
+          # Cloudflare 私有网络是按目标 IP 转发的，而 runner 的私网 IP 每次都变。
+          # 所以在回环接口上加一个固定 IP，让 cloudflared 拨这个 IP 时能落到本机 3389。
+          netsh interface ipv4 add address "Loopback Pseudo-Interface 1" 192.168.255.1 255.255.255.255 2>$null
+          if (-not $?) { netsh interface ipv4 add address 1 192.168.255.1 255.255.255.255 2>$null }
+          Start-Sleep -Seconds 3
+          Write-Host "--- 当前 IPv4 地址 ---"
+          Get-NetIPAddress -AddressFamily IPv4 | Select-Object IPAddress, InterfaceAlias | Format-Table | Out-String | Write-Host
+          $ok = (Test-NetConnection -ComputerName 192.168.255.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+          Write-Host "192.168.255.1:3389 reachable = $ok"
+          if (-not $ok) {
+            Write-Host "::error::回环别名没生效，WARP 私有网络这条路走不通（Cloudflare 域名那条不受影响）"
+          }
+
       - name: Run named tunnel + keep alive
         shell: pwsh
         env:
@@ -114,15 +129,16 @@ jobs:
           }
 
           Write-Host "============================================"
-          Write-Host "已接入固定隧道，地址恒定：https://$host_"
+          Write-Host "电脑端(cloudflared): https://$host_"
+          Write-Host "                     cloudflared access tcp --hostname $host_ --url localhost:3389"
+          Write-Host "手机端(WARP 私有网络): 192.168.255.1:3389  ← 任何 RDP App 直接填这个"
           Write-Host "用户名: runneradmin"
-          Write-Host "客户端: cloudflared access tcp --hostname $host_ --url localhost:3389"
           Write-Host "============================================"
           @(
             "## Windows RDP ready (named tunnel)",
             "",
-            "- 固定地址: ``$host_``",
-            "- 连接: ``cloudflared access tcp --hostname $host_ --url localhost:3389``",
+            "- 电脑端(cloudflared): ``$host_``",
+            "- 手机端(WARP): ``192.168.255.1:3389``",
             "- 用户名: ``runneradmin``"
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
