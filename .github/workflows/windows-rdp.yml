@@ -1,18 +1,32 @@
-# 修好的 Windows RDP workflow —— 关键改动：隧道地址会真的打印到 Actions 日志里
+# Windows RDP + Cloudflare **named tunnel**（固定域名）
 #
-# 原版问题：Start-Process 起了个独立 PowerShell 窗口跑 cloudflared，
-#           输出去不到 job 日志，runner 又没有可见桌面，所以你永远看不到 URL。
-# 这里把 cloudflared 的 stderr 重定向进文件再抓取打印，并把 tunnel + keepalive
-# 放进同一个 step，避免进程在 step 结束时被回收。
+# 跟 quick tunnel 的区别：
+#   quick tunnel 每次运行都换随机 trycloudflare.com 域名；
+#   named tunnel 的域名是你 Cloudflare 账号里的固定资产，每次跑都一样。
+#
+# 前置（只需做一次，见 README）：
+#   1. 建一个专门的隧道（别和 nas-tunnel 等共用，否则连接会被负载均衡分摊到不同地方）
+#        cloudflared tunnel create rdp-win
+#   2. 给它绑一个固定域名（DNS 是 CNAME 到 <tunnel-id>.cfargotunnel.com）
+#        cloudflared tunnel route dns rdp-win rdp.你的域名
+#   3. 把连接器 token 存进仓库 Secrets：CF_TUNNEL_TOKEN
+#        cloudflared tunnel token rdp-win
+#
+# 之后每次跑这个 workflow，runner 都会以同一个身份接入同一条隧道，
+# 地址恒为 rdp.你的域名。
 
-name: WINDOWS RDP - CLOUDFLARE (URL in log)
+name: WINDOWS RDP - NAMED TUNNEL
 
 on:
   workflow_dispatch:
+    inputs:
+      hostname:
+        description: '固定域名（只用于在日志里打印提示，实际由隧道配置决定）'
+        required: false
+        default: 'rdp.example.com'
 
 jobs:
   build:
-    # 托管 runner 硬上限 6 小时，写 9999 也只是被压到 360
     runs-on: windows-latest
     timeout-minutes: 355
 
@@ -32,48 +46,61 @@ jobs:
 
       - name: Set Administrator Password
         run: |
-          # 建议在仓库 Settings > Secrets 里加 RDP_PASSWORD；没加就退回默认值
           $pw = "${{ secrets.RDP_PASSWORD != '' && secrets.RDP_PASSWORD || 'P@ssw0rd123!' }}"
           Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pw -Force)
           Write-Host "password configured"
 
-      - name: Start Tunnel + Keep Alive
+      - name: Run named tunnel + keep alive
         shell: pwsh
+        env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
+          if (-not $env:CF_TUNNEL_TOKEN) {
+            Write-Host "::error::缺少 secrets.CF_TUNNEL_TOKEN —— 先 cloudflared tunnel token <name> 取出来存进仓库"
+            exit 1
+          }
+          $host_ = "${{ inputs.hostname }}"
           $err = Join-Path $env:RUNNER_TEMP "cf.err.log"
-          $out = Join-Path $env:RUNNER_TEMP "cf.out.log"
-          Remove-Item $err, $out -ErrorAction SilentlyContinue
+          Remove-Item $err -ErrorAction SilentlyContinue
 
           $p = Start-Process -FilePath "cloudflared" `
-                -ArgumentList 'tunnel','--url','tcp://localhost:3389','--no-autoupdate' `
-                -RedirectStandardOutput $out -RedirectStandardError $err `
+                -ArgumentList "tunnel","--no-autoupdate","run","--token",$env:CF_TUNNEL_TOKEN `
+                -RedirectStandardError $err -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP "cf.out.log") `
                 -WindowStyle Hidden -PassThru
 
-          $url = $null
-          for ($i = 0; $i -lt 45; $i++) {
+          # 等连接真正建立
+          $connected = $false
+          for ($i = 0; $i -lt 40; $i++) {
             Start-Sleep -Seconds 2
-            $hit = Select-String -Path $err, $out -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' -AllMatches -ErrorAction SilentlyContinue
-            if ($hit) { $url = @($hit)[0].Matches[0].Value; break }
+            if (Select-String -Path $err -Pattern "Registered tunnel connection" -Quiet -ErrorAction SilentlyContinue) {
+              $connected = $true; break
+            }
+            if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) { break }
           }
 
-          if (-not $url) {
-            Write-Host "::error::no tunnel url, cloudflared log:"
-            Get-Content $err, $out -ErrorAction SilentlyContinue | Select-Object -Last 40
+          if (-not $connected) {
+            Write-Host "::error::隧道没有建立连接，cloudflared 日志："
+            Get-Content $err -ErrorAction SilentlyContinue | Select-Object -Last 40
             exit 1
           }
 
-          $user = "runneradmin"
           Write-Host "============================================"
-          Write-Host "TUNNEL_URL=$url"
-          Write-Host "USERNAME=$user"
+          Write-Host "已接入固定隧道，地址恒定：https://$host_"
+          Write-Host "用户名: runneradmin"
+          Write-Host "客户端: cloudflared access tcp --hostname $host_ --url localhost:3389"
           Write-Host "============================================"
-          "## Windows RDP ready`n`n- tunnel: ``$url```n- user: ``$user``" |
-            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          @(
+            "## Windows RDP ready (named tunnel)",
+            "",
+            "- 固定地址: ``$host_``",
+            "- 连接: ``cloudflared access tcp --hostname $host_ --url localhost:3389``",
+            "- 用户名: ``runneradmin``"
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
           while ($true) {
             Start-Sleep -Seconds 60
             if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
-              Write-Host "::error::cloudflared exited ($($p.ExitCode)), tunnel is dead"
+              Write-Host "::error::cloudflared 退出，隧道断了"
               Get-Content $err -ErrorAction SilentlyContinue | Select-Object -Last 30
               exit 1
             }
