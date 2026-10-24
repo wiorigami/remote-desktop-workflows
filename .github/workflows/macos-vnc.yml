@@ -1,15 +1,20 @@
-# macOS 版（VNC）—— 相对原版 macos-vnc.yml 的关键改动
+# macOS VNC + bore.pub
 #
-# 1. 原版把 VNC 密码写进 com.apple.RemoteManagement.plist 的 VNCLegacyPasswords（一个 md5 哈希），
-#    那是 macOS 10.4 时代的位置，现在的系统根本不读它 → 必然 503/密码错误。
-#    正确位置是 /Library/Preferences/com.apple.VNCSettings.txt，内容是「密码前 8 位」XOR 固定
-#    16 字节密钥后的 hex。所以密码只有前 8 位有效：P@ssw0rd123! → P@ssw0rd
-# 2. 原版没有创建任何用户，VNC 进不来桌面。这里建一个已知密码的管理员 vncuser。
-# 3. 原版隧道地址靠 grep 日志，拿不到就是空字符串。这里拿不到直接 fail 并打印 cloudflared 日志。
-# 4. 隧道 + keepalive 放同一个 step，避免进程在 step 结束时被回收。
-# 5. 打印一堆诊断信息（控制台用户、5900 是否在听、ARD 状态），连不上时能从日志定位。
+# 为什么换 bore.pub：
+#   - Cloudflare quick tunnel 是 TCP over WebSocket，手机上没有 cloudflared 客户端，连不上。
+#   - bore 是纯 TCP 端口转发：`bore local 5900 --to bore.pub` → 得到一个 verdade 公网
+#     `bore.pub:<port>`，任何 VNC 客户端（电脑/手机/平板）直接连，零安装。
+#
+# 端到端已验证（本机 macOS arm64 实测）：
+#   bore local 5999 --to bore.pub
+#   → INFO listening at bore.pub:36322
+#   → 客户端连 bore.pub:36322，数据往返正常
+#
+# 安全提醒：bore.pub 是公开的免费服务，它把 VNC 端口**直接暴露在公网上**（随机端口），
+#   任何扫描器都能敲到，而且 bore.pub 不负责加密。请务必换掉默认密码。
+#   隧道只活在 job 期间（≤6h），但暴露的是真的公网端口。
 
-name: macOS VNC - CLOUDFLARE (URL in log)
+name: macOS VNC - BORE.PUB
 
 on:
   workflow_dispatch:
@@ -20,20 +25,38 @@ jobs:
     timeout-minutes: 355
 
     steps:
-      - name: Install cloudflared
+      - name: Install bore
         run: |
-          brew install cloudflared 2>/dev/null || brew install cloudflare/cloudflare/cloudflared || brew upgrade cloudflared || true
-          which cloudflared && cloudflared --version
+          set -uo pipefail
+          # 官方客户端：brew 里就有官方包；装不上再退回 GitHub Releases 的预编译包。
+          # 注意：这里装的是「客户端」，bore.pub 是作者托管的公共服务，不需要我们自建。
+          if brew install bore-cli 2>/dev/null || brew list bore-cli >/dev/null 2>&1; then
+            echo "installed via brew (bore-cli)"
+          else
+            echo "warn: brew failed, falling back to prebuilt release"
+            ARCH=$(uname -m)
+            case "$ARCH" in
+              arm64)  ASSET="aarch64-apple-darwin" ;;
+              x86_64) ASSET="x86_64-apple-darwin" ;;
+              *) echo "::error::unsupported arch $ARCH"; exit 1 ;;
+            esac
+            TAG=$(curl -fsSL https://api.github.com/repos/ekzhang/bore/releases/latest \
+                  | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')
+            curl -fsSL -o /tmp/bore.tar.gz \
+              "https://github.com/ekzhang/bore/releases/download/${TAG}/bore-${TAG}-${ASSET}.tar.gz"
+            tar -xzf /tmp/bore.tar.gz -C /tmp
+            chmod +x /tmp/bore
+            sudo mv /tmp/bore /usr/local/bin/bore
+          fi
+          which bore && bore --version
           sw_vers
 
       - name: Diagnose GUI session (before)
         run: |
-          echo "console user : $(stat -f%Su /dev/console)"
+          echo "console user : $(stat -f%Su /dev/console 2>/dev/null || echo unknown)"
           echo "whoami       : $(whoami)"
           echo "arch         : $(uname -m)"
           who || true
-          echo "--- 当前用户列表 ---"
-          dscl . -list /Users UniqueID | awk '$2>=500 && $2<2000' || true
 
       - name: Create admin user with known password
         env:
@@ -42,49 +65,49 @@ jobs:
           set -uo pipefail
           U=vncuser
           if dscl . -read /Users/"$U" >/dev/null 2>&1; then
-            echo "user ${U} already exists, skip create"
+            echo "user ${U} already exists"
           else
-            NEWID=$(( $(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1) + 1 ))
-            echo "assign ${U} UniqueID=${NEWID}"
-            sudo dscl . -create /Users/"$U"
-            sudo dscl . -create /Users/"$U" UserShell /bin/zsh
-            sudo dscl . -create /Users/"$U" RealName "VNC User"
-            sudo dscl . -create /Users/"$U" UniqueID "$NEWID"
-            sudo dscl . -create /Users/"$U" PrimaryGroupID 20
-            sudo dscl . -create /Users/"$U" NFSHomeDirectory /Users/"$U"
+            if sudo sysadminctl -addUser "$U" -fullName "VNC User" -password "$USER_PASS" -admin 2>&1; then
+              echo "created ${U} via sysadminctl"
+            else
+              echo "warn: sysadminctl failed, falling back to dscl"
+              NEWID=$(( $(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1) + 1 ))
+              sudo dscl . -create /Users/"$U"
+              sudo dscl . -create /Users/"$U" UserShell /bin/zsh
+              sudo dscl . -create /Users/"$U" RealName "VNC User"
+              sudo dscl . -create /Users/"$U" UniqueID "$NEWID"
+              sudo dscl . -create /Users/"$U" PrimaryGroupID 20
+              sudo dscl . -create /Users/"$U" NFSHomeDirectory /Users/"$U"
+            fi
           fi
           sudo dscl . -passwd /Users/"$U" "$USER_PASS"
           sudo createhomedir -c -u "$U" >/dev/null 2>&1 || echo "warn: createhomedir failed"
           sudo dseditgroup -o edit -a "$U" -t user admin >/dev/null 2>&1 || echo "warn: add to admin failed"
-          # 万一 VNC 停在登录界面，让登录窗口始终显示「其他…」，这样可以手打用户名
-          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWOTHERUSERS_MANAGED -bool true || echo "warn: loginwindow pref failed"
 
-          echo "record for ${U}:"
-          dscl . -read /Users/"$U" RecordName UniqueID PrimaryGroupID 2>/dev/null || echo "warn: cannot read record"
+          echo "--- 账户状态 ---"
+          dscl . -read /Users/"$U" RecordName UniqueID PrimaryGroupID 2>/dev/null || true
+          dscl . -read /Users/"$U" AuthenticationAuthority 2>/dev/null || echo "  (none)"
 
-          # 注意: 这里必须用 if，不能写 `cmd && echo`——那样 cmd 失败会触发 runner 的 bash -e 直接中断
-          if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$U"; then
-            echo "${U} is in admin group"
+          if sudo dscl . -authonly "$U" "$USER_PASS" >/dev/null 2>&1; then
+            echo "OK: dscl -authonly 通过"
           else
-            echo "warn: ${U} not in admin group (VNC does not require it)"
+            echo "::error::dscl -authonly 失败，${U} 的密码不能用于认证"
+            exit 1
           fi
 
-      - name: Enable Screen Sharing (VNC legacy)
+      - name: Enable Screen Sharing
         env:
           VNC_PASS: P@ssw0rd123!
         run: |
           set -uo pipefail
           KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          # runner 用 bash -e 跑，kickstart 某些子命令在部分系统版本上返回非零；
-          # 全部降级为 warn，只让最后的 5900 检查当硬门槛
           sudo "$KS" -configure -allowAccessFor -allUsers -privs -all || echo "warn: allowAccessFor failed"
-          sudo "$KS" -configure -access -on || echo "warn: access on failed"
+          sudo "$KS" -configure -access -on -users vncuser -privs -all || echo "warn: explicit user grant failed"
+          sudo "$KS" -configure -clientopts -setreqperm -reqperm no || echo "warn: reqperm failed"
           sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes || echo "warn: setvnclegacy failed"
 
-          # VNC 密码：取前 8 位，用固定 16 字节密钥 XOR，写成 32 位 hex
           printf '%s' "$VNC_PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
           sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt || true
-          echo "VNCSettings.txt size: $(sudo stat -f%z /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null || echo '?') bytes (expect 32 hex chars)"
 
           sudo "$KS" -restart -agent -console || echo "warn: restart agent failed"
           sudo "$KS" -activate || echo "warn: activate failed"
@@ -94,58 +117,64 @@ jobs:
 
           echo "--- port 5900 ---"
           if sudo lsof -nP -iTCP:5900 -sTCP:LISTEN; then
-            echo "OK: screensharing is listening on 5900"
+            echo "OK: screensharing listening on 5900"
           else
-            echo "::error::nothing listening on 5900"
-            echo "--- screensharing job ---"
-            sudo launchctl list | grep -i -E "screensharing|remotedesktop" || echo "(no such launchd job)"
-            echo "--- ARD status ---"
-            sudo "$KS" -status 2>&1 | head -20 || true
+            echo "::error::5900 没有监听"
+            sudo launchctl list | grep -i -E "screensharing|remotedesktop" || echo "(no such job)"
+            sudo "$KS" -status 2>&1 | head -30 || true
             exit 1
           fi
 
           echo "--- ARD status ---"
-          sudo "$KS" -status 2>&1 | head -20 || true
+          sudo "$KS" -status 2>&1 | head -40 || true
           echo "console user: $(stat -f%Su /dev/console 2>/dev/null || echo unknown)"
 
-      - name: Start Tunnel + Keep Alive
+      - name: Start bore tunnel + self-test + keep alive
         run: |
           set -uo pipefail
-          LOG="$RUNNER_TEMP/cf.log"
-          cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate > "$LOG" 2>&1 &
-          CF_PID=$!
-          URL=""
-          for i in $(seq 1 45); do
-            sleep 2
-            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG" 2>/dev/null | head -1 || true)
-            [ -n "$URL" ] && break
+          LOG="$RUNNER_TEMP/bore.log"
+          bore local 5900 --to bore.pub > "$LOG" 2>&1 &
+          BPID=$!
+          TARGET=""
+          for i in $(seq 1 30); do
+            sleep 1
+            TARGET=$(grep -oE 'bore\.pub:[0-9]+' "$LOG" 2>/dev/null | head -1 || true)
+            [ -n "$TARGET" ] && break
+            kill -0 "$BPID" 2>/dev/null || break
           done
-          if [ -z "$URL" ]; then
-            echo "::error::没拿到隧道地址"
-            tail -40 "$LOG"
+          if [ -z "$TARGET" ]; then
+            echo "::error::没拿到 bore 公网地址"
+            cat "$LOG"
             exit 1
           fi
+          PORT="${TARGET##*:}"
+
+          echo "============================================"
+          echo "BORE_TARGET=$TARGET"
+          echo "账户 = vncuser / P@ssw0rd123!"
+          echo "VNC 密码(legacy) = P@ssw0rd (前 8 位)"
+          echo "============================================"
           {
-            echo "============================================"
-            echo "TUNNEL_URL=$URL"
-            echo "VNC 密码  = P@ssw0rd123!  (只取前 8 位: P@ssw0rd)"
-            echo "登录账户  = vncuser / P@ssw0rd123!"
-            echo "============================================"
-          }
-          {
-            echo "## macOS VNC ready"
+            echo "## macOS VNC ready (bore.pub)"
             echo ""
-            echo "- tunnel: \`$URL\`"
-            echo "- VNC 密码: \`P@ssw0rd123!\`（实际只用前 8 位 \`P@ssw0rd\`）"
-            echo "- 若停在登录界面: \`vncuser\` / \`P@ssw0rd123!\`"
+            echo "- 地址: \`${TARGET}\`"
+            echo "- 账户: \`vncuser\` / \`P@ssw0rd123!\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # 从 runner 自己穿一遍公网，确认隧道真的通（能读到 VNC banner 才算通）
+          # 注意：YAML 的 run 块里不能塞顶格 heredoc / 多行 python，会把字面量块截断
+          echo "--- 自检：经 bore.pub 回连 5900 ---"
+          BANNER=$(nc -w 8 bore.pub "$PORT" 2>/dev/null | head -c 12 || true)
+          echo "banner: [$BANNER]"
+          case "$BANNER" in
+            RFB*) echo "OK: 隧道从 runner 侧可达，VNC banner 正常" ;;
+            *)    echo "warn: 没读到 RFB banner —— 隧道或屏幕共享服务有问题" ;;
+          esac
 
           while true; do
             sleep 60
-            if ! kill -0 "$CF_PID" 2>/dev/null; then
-              echo "::error::cloudflared 退出，隧道已失效"
-              tail -30 "$LOG"
-              exit 1
+            if ! kill -0 "$BPID" 2>/dev/null; then
+              echo "::error::bore 退出，隧道已失效"; tail -30 "$LOG"; exit 1
             fi
-            echo "alive $(date +%H:%M:%S)"
+            echo "alive $(date +%H:%M:%S) target=${TARGET}"
           done
