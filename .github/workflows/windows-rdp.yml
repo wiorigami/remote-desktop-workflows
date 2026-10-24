@@ -1,11 +1,20 @@
-name: WINDOWS RDP - CLOUDFLARE
+# 修好的 Windows RDP workflow —— 关键改动：隧道地址会真的打印到 Actions 日志里
+#
+# 原版问题：Start-Process 起了个独立 PowerShell 窗口跑 cloudflared，
+#           输出去不到 job 日志，runner 又没有可见桌面，所以你永远看不到 URL。
+# 这里把 cloudflared 的 stderr 重定向进文件再抓取打印，并把 tunnel + keepalive
+# 放进同一个 step，避免进程在 step 结束时被回收。
+
+name: WINDOWS RDP - CLOUDFLARE (URL in log)
+
 on:
-  workflow_dispatch
+  workflow_dispatch:
 
 jobs:
   build:
+    # 托管 runner 硬上限 6 小时，写 9999 也只是被压到 360
     runs-on: windows-latest
-    timeout-minutes: 9999
+    timeout-minutes: 355
 
     steps:
       - name: Setup Cloudflared
@@ -16,36 +25,57 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
-          Write-Host "✅ RDP Enabled Successfully!"
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 3
+          $ok = (Test-NetConnection -ComputerName 127.0.0.1 -Port 3389 -WarningAction SilentlyContinue).TcpTestSucceeded
+          Write-Host "3389 listening: $ok"
 
       - name: Set Administrator Password
         run: |
-          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "P@ssw0rd123!" -Force)
-          Write-Host "✅ Password Configured!"
+          # 建议在仓库 Settings > Secrets 里加 RDP_PASSWORD；没加就退回默认值
+          $pw = "${{ secrets.RDP_PASSWORD != '' && secrets.RDP_PASSWORD || 'P@ssw0rd123!' }}"
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText $pw -Force)
+          Write-Host "password configured"
 
-      - name: Start Cloudflare Tunnel
+      - name: Start Tunnel + Keep Alive
+        shell: pwsh
         run: |
-          Write-Host "============================================"
-          Write-Host "🚀 WINDOWS RDP - CLOUDFLARE TUNNEL"
-          Write-Host "============================================"
-          Write-Host ""
-          Start-Process PowerShell -ArgumentList '-NoExit -Command "cloudflared tunnel --url tcp://localhost:3389"'
-          Start-Sleep -Seconds 15
-          Write-Host ""
-          Write-Host "✅ TUNNEL STARTED! Check separate PowerShell window for URL"
-          Write-Host ""
-          Write-Host "📋 CONNECTION DETAILS:"
-          Write-Host "   USERNAME: runneradmin"
-          Write-Host "   PASSWORD: P@ssw0rd123!"
-          Write-Host "   OS: Windows Server 2022"
-          Write-Host "   CPU: 4 cores"
-          Write-Host "   RAM: 16GB"
-          Write-Host "============================================"
+          $err = Join-Path $env:RUNNER_TEMP "cf.err.log"
+          $out = Join-Path $env:RUNNER_TEMP "cf.out.log"
+          Remove-Item $err, $out -ErrorAction SilentlyContinue
 
-      - name: Keep Session Alive
-        run: |
-          Write-Host "⏳ Session Active - Keeping alive..."
+          $p = Start-Process -FilePath "cloudflared" `
+                -ArgumentList 'tunnel','--url','tcp://localhost:3389','--no-autoupdate' `
+                -RedirectStandardOutput $out -RedirectStandardError $err `
+                -WindowStyle Hidden -PassThru
+
+          $url = $null
+          for ($i = 0; $i -lt 45; $i++) {
+            Start-Sleep -Seconds 2
+            $hit = Select-String -Path $err, $out -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' -AllMatches -ErrorAction SilentlyContinue
+            if ($hit) { $url = @($hit)[0].Matches[0].Value; break }
+          }
+
+          if (-not $url) {
+            Write-Host "::error::no tunnel url, cloudflared log:"
+            Get-Content $err, $out -ErrorAction SilentlyContinue | Select-Object -Last 40
+            exit 1
+          }
+
+          $user = "runneradmin"
+          Write-Host "============================================"
+          Write-Host "TUNNEL_URL=$url"
+          Write-Host "USERNAME=$user"
+          Write-Host "============================================"
+          "## Windows RDP ready`n`n- tunnel: ``$url```n- user: ``$user``" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
           while ($true) {
             Start-Sleep -Seconds 60
-            Write-Host "✓ Active - $(Get-Date -Format 'HH:mm:ss')"
+            if (-not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue)) {
+              Write-Host "::error::cloudflared exited ($($p.ExitCode)), tunnel is dead"
+              Get-Content $err -ErrorAction SilentlyContinue | Select-Object -Last 30
+              exit 1
+            }
+            Write-Host "alive $(Get-Date -Format 'HH:mm:ss')"
           }
