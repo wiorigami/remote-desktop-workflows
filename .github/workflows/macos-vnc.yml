@@ -101,18 +101,42 @@ jobs:
         run: |
           set -uo pipefail
           KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          sudo "$KS" -configure -allowAccessFor -allUsers -privs -all || echo "warn: allowAccessFor failed"
-          sudo "$KS" -configure -access -on -users vncuser -privs -all || echo "warn: explicit user grant failed"
-          sudo "$KS" -configure -clientopts -setreqperm -reqperm no || echo "warn: reqperm failed"
-          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes || echo "warn: setvnclegacy failed"
+          # 每条 kickstart 都单独报告成功/失败 —— 之前全都 || echo warn 吞掉了，
+          # 结果「服务在监听、但所有认证都被拒」，排查绕了很远
+          run_ks() {
+            echo "+ kickstart $*"
+            if sudo "$KS" "$@" 2>&1 | sed 's/^/    /'; then
+              echo "  => OK"
+            else
+              echo "  => FAILED (exit $?)"
+            fi
+          }
+
+          run_ks -configure -allowAccessFor -allUsers -privs -all
+          run_ks -configure -access -on -users vncuser -privs -all
+          run_ks -configure -clientopts -setreqperm -reqperm no
+          run_ks -configure -clientopts -setvnclegacy -vnclegacy yes
+
+          # 兜底：kickstart 有时「成功退出但没真写进去」，直接核对并补写 plist 关键项
+          if ! sudo defaults read /Library/Preferences/com.apple.RemoteManagement VNCLegacyConnectionsEnabled 2>/dev/null | grep -qi 1; then
+            echo "warn: VNCLegacyConnectionsEnabled 没打开，直接写 plist 兜底"
+            sudo defaults write /Library/Preferences/com.apple.RemoteManagement VNCLegacyConnectionsEnabled -bool true
+          else
+            echo "OK: VNCLegacyConnectionsEnabled = true"
+          fi
 
           printf '%s' "$VNC_PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
           sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt || true
 
-          sudo "$KS" -restart -agent -console || echo "warn: restart agent failed"
-          sudo "$KS" -activate || echo "warn: activate failed"
+          run_ks -restart -agent -console
+          # -activate 是关键：只 load launchd 会让端口应答 banner，但 Remote Management
+          # 没激活时所有认证都会被拒（0x01000000 "Authentication or authorization failure"）
+          if ! sudo "$KS" -activate 2>&1 | sed 's/^/    /'; then
+            echo "::error::kickstart -activate 失败 —— 这就是认证被拒的根因"
+          fi
           sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
           sleep 6
 
           echo "--- port 5900 ---"
@@ -127,6 +151,11 @@ jobs:
 
           echo "--- ARD status ---"
           sudo "$KS" -status 2>&1 | head -40 || true
+          echo "--- RemoteManagement plist（关键：VNCLegacyConnectionsEnabled / AllowUsers）---"
+          sudo defaults read /Library/Preferences/com.apple.RemoteManagement 2>/dev/null | head -40 || echo "(plist 不存在)"
+          echo "--- VNCSettings ---"
+          sudo stat -f "%N %z bytes mode=%Sp owner=%Su" /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null || echo "(不存在)"
+          sudo cat /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null
           echo "console user: $(stat -f%Su /dev/console 2>/dev/null || echo unknown)"
 
       - name: Start bore tunnel + self-test + keep alive
