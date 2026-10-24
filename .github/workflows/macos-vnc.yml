@@ -41,25 +41,33 @@ jobs:
         run: |
           set -uo pipefail
           U=vncuser
-          if dscl . -read /Users/$U >/dev/null 2>&1; then
-            echo "$U 已存在，跳过创建"
+          if dscl . -read /Users/"$U" >/dev/null 2>&1; then
+            echo "user ${U} already exists, skip create"
           else
             NEWID=$(( $(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1) + 1 ))
-            echo "给 $U 分配 UniqueID=$NEWID"
-            sudo dscl . -create /Users/$U
-            sudo dscl . -create /Users/$U UserShell /bin/zsh
-            sudo dscl . -create /Users/$U RealName "VNC User"
-            sudo dscl . -create /Users/$U UniqueID "$NEWID"
-            sudo dscl . -create /Users/$U PrimaryGroupID 20
-            sudo dscl . -create /Users/$U NFSHomeDirectory /Users/$U
+            echo "assign ${U} UniqueID=${NEWID}"
+            sudo dscl . -create /Users/"$U"
+            sudo dscl . -create /Users/"$U" UserShell /bin/zsh
+            sudo dscl . -create /Users/"$U" RealName "VNC User"
+            sudo dscl . -create /Users/"$U" UniqueID "$NEWID"
+            sudo dscl . -create /Users/"$U" PrimaryGroupID 20
+            sudo dscl . -create /Users/"$U" NFSHomeDirectory /Users/"$U"
           fi
-          sudo dscl . -passwd /Users/$U "$USER_PASS"
-          sudo createhomedir -c -u $U >/dev/null 2>&1 || true
-          sudo dseditgroup -o edit -a $U -t user admin 2>/dev/null || true
+          sudo dscl . -passwd /Users/"$U" "$USER_PASS"
+          sudo createhomedir -c -u "$U" >/dev/null 2>&1 || echo "warn: createhomedir failed"
+          sudo dseditgroup -o edit -a "$U" -t user admin >/dev/null 2>&1 || echo "warn: add to admin failed"
           # 万一 VNC 停在登录界面，让登录窗口始终显示「其他…」，这样可以手打用户名
-          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWOTHERUSERS_MANAGED -bool true
-          echo "已创建/更新 $U，管理员组:"
-          dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -x "$U" && echo "  ✓ 在 admin 组"
+          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWOTHERUSERS_MANAGED -bool true || echo "warn: loginwindow pref failed"
+
+          echo "record for ${U}:"
+          dscl . -read /Users/"$U" RecordName UniqueID PrimaryGroupID 2>/dev/null || echo "warn: cannot read record"
+
+          # 注意: 这里必须用 if，不能写 `cmd && echo`——那样 cmd 失败会触发 runner 的 bash -e 直接中断
+          if dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -qx "$U"; then
+            echo "${U} is in admin group"
+          else
+            echo "warn: ${U} not in admin group (VNC does not require it)"
+          fi
 
       - name: Enable Screen Sharing (VNC legacy)
         env:
@@ -67,32 +75,38 @@ jobs:
         run: |
           set -uo pipefail
           KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          sudo "$KS" -configure -allowAccessFor -allUsers -privs -all
-          sudo "$KS" -configure -access -on
-          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes
+          # runner 用 bash -e 跑，kickstart 某些子命令在部分系统版本上返回非零；
+          # 全部降级为 warn，只让最后的 5900 检查当硬门槛
+          sudo "$KS" -configure -allowAccessFor -allUsers -privs -all || echo "warn: allowAccessFor failed"
+          sudo "$KS" -configure -access -on || echo "warn: access on failed"
+          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes || echo "warn: setvnclegacy failed"
 
           # VNC 密码：取前 8 位，用固定 16 字节密钥 XOR，写成 32 位 hex
-          printf '%s' "$VNC_PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
-          sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
-          echo "VNCSettings.txt 已写入 ($(sudo wc -c < /Library/Preferences/com.apple.VNCSettings.txt) 字节)"
+          printf '%s' "$VNC_PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
+          sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt || true
+          echo "VNCSettings.txt size: $(sudo stat -f%z /Library/Preferences/com.apple.VNCSettings.txt 2>/dev/null || echo '?') bytes (expect 32 hex chars)"
 
-          sudo "$KS" -restart -agent -console
-          sudo "$KS" -activate
+          sudo "$KS" -restart -agent -console || echo "warn: restart agent failed"
+          sudo "$KS" -activate || echo "warn: activate failed"
           sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-          sleep 5
+          sleep 6
 
-          echo "--- 5900 监听情况 ---"
+          echo "--- port 5900 ---"
           if sudo lsof -nP -iTCP:5900 -sTCP:LISTEN; then
-            echo "✓ Screen Sharing 在 5900 上监听"
+            echo "OK: screensharing is listening on 5900"
           else
-            echo "::error::5900 没有监听"
-            sudo launchctl list | grep -i -E "screensharing|RemoteDesktop" || true
+            echo "::error::nothing listening on 5900"
+            echo "--- screensharing job ---"
+            sudo launchctl list | grep -i -E "screensharing|remotedesktop" || echo "(no such launchd job)"
+            echo "--- ARD status ---"
+            sudo "$KS" -status 2>&1 | head -20 || true
             exit 1
           fi
-          echo "--- ARD 状态 ---"
+
+          echo "--- ARD status ---"
           sudo "$KS" -status 2>&1 | head -20 || true
-          echo "console user: $(stat -f%Su /dev/console)"
+          echo "console user: $(stat -f%Su /dev/console 2>/dev/null || echo unknown)"
 
       - name: Start Tunnel + Keep Alive
         run: |
