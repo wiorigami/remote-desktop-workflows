@@ -23,7 +23,7 @@ on:
       hostname:
         description: '固定域名（只用于在日志里打印提示，实际由隧道配置决定）'
         required: false
-        default: 'rdp.example.com'
+        default: 'rdp.oriweb.cc'
 
 jobs:
   build:
@@ -59,12 +59,41 @@ jobs:
             Write-Host "::error::缺少 secrets.CF_TUNNEL_TOKEN —— 先 cloudflared tunnel token <name> 取出来存进仓库"
             exit 1
           }
+          # 容忍复制时带入的换行/空格：这些字符会破坏 token 认证
+          $tok = ($env:CF_TUNNEL_TOKEN -replace '\s','')
+          Write-Host "token 字符数: $($tok.Length)   (期望 180)"
+
+          # 指纹自检：先用本地解码 + 哈希，确认收到的是什么，再决定要不要连
+          try {
+            $obj = ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($tok))) | ConvertFrom-Json
+            $sha1 = [BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash(
+                      [Text.Encoding]::UTF8.GetBytes($obj.s))).Replace('-','').ToLower()
+            $sha2 = [BitConverter]::ToString(([Security.Cryptography.SHA256]::Create()).ComputeHash(
+                      [Text.Encoding]::UTF8.GetBytes($tok))).Replace('-','').ToLower()
+            Write-Host "  tunnel id        : $($obj.t)"
+            Write-Host "  secret sha256[16] : $($sha1.Substring(0,16))   (期望 d940d602eeae3235)"
+            Write-Host "  token  sha256     : $sha2"
+            Write-Host "                    (期望 88c83eb1b2758dae528aff1f7786e3709823b03da79612d353a7090d39da4904)"
+            if ($obj.t -ne "365b63f9-9dfd-4520-a067-4effaef23f16") {
+              Write-Host "::error::token 指向的隧道不是 rdp-win（$($obj.t)），Secret 贴错了"
+              exit 1
+            }
+            if ($sha1.Substring(0,16) -ne "d940d602eeae3235") {
+              Write-Host "::error::token 里的 secret 不对（指纹不匹配）—— Secret 内容有字符被改动"
+              exit 1
+            }
+            Write-Host "  => token 自检通过"
+          } catch {
+            Write-Host "::error::token 不是合法的 base64 JSON: $($_.Exception.Message)"
+            exit 1
+          }
+
           $host_ = "${{ inputs.hostname }}"
           $err = Join-Path $env:RUNNER_TEMP "cf.err.log"
           Remove-Item $err -ErrorAction SilentlyContinue
 
           $p = Start-Process -FilePath "cloudflared" `
-                -ArgumentList "tunnel","--no-autoupdate","run","--token",$env:CF_TUNNEL_TOKEN `
+                -ArgumentList "tunnel","--no-autoupdate","run","--token",$tok `
                 -RedirectStandardError $err -RedirectStandardOutput (Join-Path $env:RUNNER_TEMP "cf.out.log") `
                 -WindowStyle Hidden -PassThru
 
