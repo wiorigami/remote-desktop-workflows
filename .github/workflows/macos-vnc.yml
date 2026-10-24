@@ -1,69 +1,137 @@
-name: macOS VNC - CLOUDFLARE
+# macOS 版（VNC）—— 相对原版 macos-vnc.yml 的关键改动
+#
+# 1. 原版把 VNC 密码写进 com.apple.RemoteManagement.plist 的 VNCLegacyPasswords（一个 md5 哈希），
+#    那是 macOS 10.4 时代的位置，现在的系统根本不读它 → 必然 503/密码错误。
+#    正确位置是 /Library/Preferences/com.apple.VNCSettings.txt，内容是「密码前 8 位」XOR 固定
+#    16 字节密钥后的 hex。所以密码只有前 8 位有效：P@ssw0rd123! → P@ssw0rd
+# 2. 原版没有创建任何用户，VNC 进不来桌面。这里建一个已知密码的管理员 vncuser。
+# 3. 原版隧道地址靠 grep 日志，拿不到就是空字符串。这里拿不到直接 fail 并打印 cloudflared 日志。
+# 4. 隧道 + keepalive 放同一个 step，避免进程在 step 结束时被回收。
+# 5. 打印一堆诊断信息（控制台用户、5900 是否在听、ARD 状态），连不上时能从日志定位。
+
+name: macOS VNC - CLOUDFLARE (URL in log)
+
 on:
-  workflow_dispatch
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: macos-latest
-    timeout-minutes: 9999
+    timeout-minutes: 355
 
     steps:
-      - name: Install Cloudflared
+      - name: Install cloudflared
         run: |
-          brew install cloudflare/cloudflare/cloudflared
-          echo "✅ Cloudflared Installed!"
+          brew install cloudflared 2>/dev/null || brew install cloudflare/cloudflare/cloudflared || brew upgrade cloudflared || true
+          which cloudflared && cloudflared --version
+          sw_vers
 
-      - name: Enable VNC/Screen Sharing
+      - name: Diagnose GUI session (before)
         run: |
-          sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart -activate -configure -access -on -restart -agent -privs -all -allowAccessFor -allUsers
-          sudo defaults write /var/db/launchd.db/com.apple.launchd/overrides.plist com.apple.screensharing -dict Disabled -bool false
-          echo "✅ VNC Enabled!"
+          echo "console user : $(stat -f%Su /dev/console)"
+          echo "whoami       : $(whoami)"
+          echo "arch         : $(uname -m)"
+          who || true
+          echo "--- 当前用户列表 ---"
+          dscl . -list /Users UniqueID | awk '$2>=500 && $2<2000' || true
 
-      - name: Set VNC Password (Legacy VNC)
-        shell: bash
+      - name: Create admin user with known password
+        env:
+          USER_PASS: P@ssw0rd123!
         run: |
-          set -e
-          # Ensure RemoteManagement directories exist and proper ownership
-          sudo mkdir -p /Library/Preferences
-          # Use kickstart with sudo to set legacy VNC password
-          echo "P@ssw0rd123!" | sudo /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart \
-            -activate -configure -access -on -restart -agent -privs -all \
-            -clientopts -setvnclegacy -vnclegacy yes -setvncpw -vncpw P@ssw0rd123!
-          # Also set system VNC password key (some runners require this)
-          sudo /usr/libexec/PlistBuddy -c "Add :VNCLegacyPasswords array" /Library/Preferences/com.apple.RemoteManagement.plist 2>/dev/null || true
-          sudo /usr/libexec/PlistBuddy -c "Delete :VNCLegacyPasswords:0" /Library/Preferences/com.apple.RemoteManagement.plist 2>/dev/null || true
-          HASH=$(python3 - <<'PY'
-import sys,hashlib
-print(hashlib.md5(b"P@ssw0rd123!").hexdigest())
-PY
-)
-          sudo /usr/libexec/PlistBuddy -c "Add :VNCLegacyPasswords:0 data $(echo $HASH | xxd -r -p | base64)" /Library/Preferences/com.apple.RemoteManagement.plist
-          sudo launchctl unload /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
-          echo "✅ VNC Password Set!"
+          set -uo pipefail
+          U=vncuser
+          if dscl . -read /Users/$U >/dev/null 2>&1; then
+            echo "$U 已存在，跳过创建"
+          else
+            NEWID=$(( $(dscl . -list /Users UniqueID | awk '{print $2}' | sort -n | tail -1) + 1 ))
+            echo "给 $U 分配 UniqueID=$NEWID"
+            sudo dscl . -create /Users/$U
+            sudo dscl . -create /Users/$U UserShell /bin/zsh
+            sudo dscl . -create /Users/$U RealName "VNC User"
+            sudo dscl . -create /Users/$U UniqueID "$NEWID"
+            sudo dscl . -create /Users/$U PrimaryGroupID 20
+            sudo dscl . -create /Users/$U NFSHomeDirectory /Users/$U
+          fi
+          sudo dscl . -passwd /Users/$U "$USER_PASS"
+          sudo createhomedir -c -u $U >/dev/null 2>&1 || true
+          sudo dseditgroup -o edit -a $U -t user admin 2>/dev/null || true
+          # 万一 VNC 停在登录界面，让登录窗口始终显示「其他…」，这样可以手打用户名
+          sudo defaults write /Library/Preferences/com.apple.loginwindow SHOWOTHERUSERS_MANAGED -bool true
+          echo "已创建/更新 $U，管理员组:"
+          dscl . -read /Groups/admin GroupMembership 2>/dev/null | tr ' ' '\n' | grep -x "$U" && echo "  ✓ 在 admin 组"
 
-      - name: Start Cloudflare Tunnel
+      - name: Enable Screen Sharing (VNC legacy)
+        env:
+          VNC_PASS: P@ssw0rd123!
         run: |
-          echo "============================================"
-          echo "🚀 macOS VNC - CLOUDFLARE TUNNEL"
-          echo "============================================"
-          echo ""
-          cloudflared tunnel --url tcp://localhost:5900 > tunnel.log 2>&1 &
-          sleep 15
-          cat tunnel.log | grep -o 'https://[^[:space:]]*trycloudflare.com' || echo "Check logs for tunnel URL"
-          echo ""
-          echo "✅ TUNNEL STARTED!"
-          echo ""
-          echo "📋 CONNECTION DETAILS:"
-          echo "   PASSWORD: P@ssw0rd123!"
-          echo "   OS: macOS Monterey/Ventura"
-          echo "   Architecture: $(uname -m)"
-          echo "============================================"
+          set -uo pipefail
+          KS=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo "$KS" -configure -allowAccessFor -allUsers -privs -all
+          sudo "$KS" -configure -access -on
+          sudo "$KS" -configure -clientopts -setvnclegacy -vnclegacy yes
 
-      - name: Keep Session Alive
+          # VNC 密码：取前 8 位，用固定 16 字节密钥 XOR，写成 32 位 hex
+          printf '%s' "$VNC_PASS" | perl -we 'BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA"}; $_ = <>; chomp; s/^(.{8}).*/$1/; @p = unpack "C*", $_; foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }; print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
+          sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
+          echo "VNCSettings.txt 已写入 ($(sudo wc -c < /Library/Preferences/com.apple.VNCSettings.txt) 字节)"
+
+          sudo "$KS" -restart -agent -console
+          sudo "$KS" -activate
+          sudo launchctl enable system/com.apple.screensharing 2>/dev/null || true
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sleep 5
+
+          echo "--- 5900 监听情况 ---"
+          if sudo lsof -nP -iTCP:5900 -sTCP:LISTEN; then
+            echo "✓ Screen Sharing 在 5900 上监听"
+          else
+            echo "::error::5900 没有监听"
+            sudo launchctl list | grep -i -E "screensharing|RemoteDesktop" || true
+            exit 1
+          fi
+          echo "--- ARD 状态 ---"
+          sudo "$KS" -status 2>&1 | head -20 || true
+          echo "console user: $(stat -f%Su /dev/console)"
+
+      - name: Start Tunnel + Keep Alive
         run: |
-          echo "⏳ Session Active - Keeping alive..."
+          set -uo pipefail
+          LOG="$RUNNER_TEMP/cf.log"
+          cloudflared tunnel --url tcp://localhost:5900 --no-autoupdate > "$LOG" 2>&1 &
+          CF_PID=$!
+          URL=""
+          for i in $(seq 1 45); do
+            sleep 2
+            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG" 2>/dev/null | head -1 || true)
+            [ -n "$URL" ] && break
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::没拿到隧道地址"
+            tail -40 "$LOG"
+            exit 1
+          fi
+          {
+            echo "============================================"
+            echo "TUNNEL_URL=$URL"
+            echo "VNC 密码  = P@ssw0rd123!  (只取前 8 位: P@ssw0rd)"
+            echo "登录账户  = vncuser / P@ssw0rd123!"
+            echo "============================================"
+          }
+          {
+            echo "## macOS VNC ready"
+            echo ""
+            echo "- tunnel: \`$URL\`"
+            echo "- VNC 密码: \`P@ssw0rd123!\`（实际只用前 8 位 \`P@ssw0rd\`）"
+            echo "- 若停在登录界面: \`vncuser\` / \`P@ssw0rd123!\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
           while true; do
             sleep 60
-            echo "✓ Active - $(date '+%H:%M:%S')"
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              echo "::error::cloudflared 退出，隧道已失效"
+              tail -30 "$LOG"
+              exit 1
+            fi
+            echo "alive $(date +%H:%M:%S)"
           done
